@@ -44,6 +44,7 @@ defmodule FLAME.Pool do
   @boot_timeout 30_000
   @idle_shutdown_after 30_000
   @async_boot_debounce 1_000
+  @max_restore_delay 60_000
 
   defstruct name: nil,
             runner_sup: nil,
@@ -66,6 +67,8 @@ defmodule FLAME.Pool do
             on_shrink: nil,
             async_boot_timer: nil,
             restore_timer: nil,
+            restore_delay: @async_boot_debounce,
+            restore_refs: MapSet.new(),
             growers: %{},
             track_resources: false,
             base_sync_stream: nil
@@ -77,10 +80,13 @@ defmodule FLAME.Pool do
 
   The runner is booted like a `:min` runner: it honours `:min_idle_shutdown_after`
   rather than `:idle_shutdown_after`, so a runner grown ahead of moving work onto
-  it is not shut down as idle before the work arrives.
+  it is not shut down as idle before the work arrives. With the default
+  `:min_idle_shutdown_after` of `:infinity` it stays up until it is stopped, so a
+  caller that grows the pool to replace a runner is expected to stop that runner.
 
-  `timeout` bounds the wait for the reply; the boot itself is bounded by the pool's
-  `:boot_timeout`.
+  `timeout` bounds only the caller's wait. Timing out does not cancel the boot.
+
+  The growth callbacks receive `reason: :grow` in their metadata.
   """
   def grow(name, timeout \\ :infinity) do
     GenServer.call(name, :grow, timeout)
@@ -142,12 +148,16 @@ defmodule FLAME.Pool do
         * `:name` - The name of the pool
         * `:count` - The number of runners the pool is attempting to grow to
         * `:pid` - The pid of the async process that is booting the new runner
+        * `:reason` - Why the runner is booting: `:demand` (callers are waiting),
+          `:grow` (`grow/2`) or `:restore` (a running runner went down and left the
+          pool below `:min`; this boot is not growth beyond `:min`)
 
      * `:on_grow_end` - The optional 2-arity function to be called when the pool growth process completes.
       The 2-arity function receives either `:ok` or `{:exit, reason}`, and map with the following metadata:
 
         * `:name` - The name of the pool
         * `:count` - The number of runners the pool is now at
+        * `:reason` - `:demand`, `:grow` or `:restore`, as for `:on_grow_start`
         * `:pid` - The pid of the async process that attempted to boot the new runner
 
     * `:on_shrink` - The optional function to be called when the pool shrinks.
@@ -511,11 +521,19 @@ defmodule FLAME.Pool do
       when is_reference(ref) and is_map_key(state.pending_runners, ref) do
     Process.demonitor(ref, [:flush])
     pid = Map.fetch!(state.pending_runners, ref)
-    {:noreply, handle_down(state, {:DOWN, ref, :process, pid, {:error, reason}})}
+    {:noreply, handle_down(state, {:DOWN, ref, :process, pid, reason})}
   end
 
+  # Demand is checked again when the timer fires: `grow/2` or a restore may have
+  # taken the capacity this retry was scheduled for.
   def handle_info(:async_boot_continue, %Pool{} = state) do
-    {:noreply, async_boot_runner(%{state | async_boot_timer: nil})}
+    state = %{state | async_boot_timer: nil}
+
+    if has_unmet_servicable_demand?(state) do
+      {:noreply, async_boot_runner(state)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:restore_min, %Pool{} = state) do
@@ -541,7 +559,7 @@ defmodule FLAME.Pool do
     if runner_count(state) >= state.max do
       {:reply, {:error, :max_runners}, state}
     else
-      {ref, state} = start_async_boot(state, floor_runner_opts(state))
+      {ref, state} = start_async_boot(state, floor_runner_opts(state), :grow)
       {:noreply, %{state | growers: Map.put(state.growers, ref, from)}}
     end
   end
@@ -712,16 +730,21 @@ defmodule FLAME.Pool do
   end
 
   defp async_boot_runner(%Pool{} = state) do
-    {_ref, state} = start_async_boot(state, [])
+    {_ref, state} = start_async_boot(state, [], :demand)
     state
   end
 
-  defp start_async_boot(%Pool{on_grow_start: on_grow_start, name: name} = state, runner_opts) do
+  defp start_async_boot(
+         %Pool{on_grow_start: on_grow_start, name: name} = state,
+         runner_opts,
+         reason
+       ) do
     new_count = runner_count(state) + 1
 
     task =
       Task.Supervisor.async_nolink(state.task_sup, fn ->
-        if on_grow_start, do: on_grow_start.(%{count: new_count, name: name, pid: self()})
+        if on_grow_start,
+          do: on_grow_start.(%{count: new_count, name: name, pid: self(), reason: reason})
 
         start_child_runner(state, runner_opts)
       end)
@@ -737,25 +760,58 @@ defmodule FLAME.Pool do
   end
 
   # Brings the pool back up to `:min` after a running runner went down or a
-  # replacement failed to boot. Debounced like demand-driven boots, so a backend
-  # that keeps failing is retried once a second at most, not in a tight loop.
+  # replacement failed to boot. The first attempt waits the usual debounce; each
+  # failed restore doubles the wait, up to a minute, so a backend that keeps
+  # failing is not asked for machines in a tight loop. A restore that comes up
+  # with the pool back at `:min` resets it.
   defp schedule_restore_min(%Pool{} = state) do
     if runner_count(state) < state.min and is_nil(state.restore_timer) do
-      timer = Process.send_after(self(), :restore_min, @async_boot_debounce)
+      timer = Process.send_after(self(), :restore_min, state.restore_delay)
       %{state | restore_timer: timer}
     else
       state
     end
   end
 
+  # Boots only the deficit, counting pending boots, so the pool never passes
+  # `:min` (and so never `:max`) through a restore.
   defp restore_min(%Pool{} = state) do
     missing = state.min - runner_count(state)
 
     if missing > 0 do
       Enum.reduce(1..missing, state, fn _, acc ->
-        {_ref, acc} = start_async_boot(acc, floor_runner_opts(acc))
-        acc
+        {ref, acc} = start_async_boot(acc, floor_runner_opts(acc), :restore)
+        %{acc | restore_refs: MapSet.put(acc.restore_refs, ref)}
       end)
+    else
+      state
+    end
+  end
+
+  defp boot_reason(%Pool{} = state, ref) do
+    cond do
+      is_map_key(state.growers, ref) -> :grow
+      MapSet.member?(state.restore_refs, ref) -> :restore
+      true -> :demand
+    end
+  end
+
+  # A restore boot finished. On failure the next restore waits longer; on success
+  # with the pool back at `:min`, the wait is reset.
+  defp settle_restore(%Pool{} = state, ref, result) do
+    if MapSet.member?(state.restore_refs, ref) do
+      state = %{state | restore_refs: MapSet.delete(state.restore_refs, ref)}
+
+      case result do
+        :ok when map_size(state.runners) >= state.min ->
+          %{state | restore_delay: @async_boot_debounce}
+
+        :ok ->
+          state
+
+        :error ->
+          %{state | restore_delay: min(state.restore_delay * 2, @max_restore_delay)}
+      end
     else
       state
     end
@@ -884,22 +940,25 @@ defmodule FLAME.Pool do
 
     state =
       case state.runners do
+        # A runner that idled out was meant to go; only an unexpected exit is replaced.
+        %{^ref => _} when reason == {:shutdown, :idle} -> drop_child_runner(state, ref)
         %{^ref => _} -> state |> drop_child_runner(ref) |> schedule_restore_min()
         %{} -> state
       end
 
     case state.pending_runners do
       %{^ref => _} ->
+        boot_reason = boot_reason(state, ref)
         state = %{state | pending_runners: Map.delete(state.pending_runners, ref)}
-        state = reply_grower(state, ref, {:error, reason})
+        state = state |> reply_grower(ref, {:error, reason}) |> settle_restore(ref, :error)
         # we rate limit this to avoid many failed async boot attempts
         state =
           if has_unmet_servicable_demand?(state) do
             state
-            |> maybe_on_grow_end(pid, {:exit, reason})
+            |> maybe_on_grow_end(pid, {:exit, reason}, boot_reason)
             |> schedule_async_boot_runner()
           else
-            maybe_on_grow_end(state, pid, {:exit, reason})
+            maybe_on_grow_end(state, pid, {:exit, reason}, boot_reason)
           end
 
         schedule_restore_min(state)
@@ -920,9 +979,9 @@ defmodule FLAME.Pool do
     end
   end
 
-  defp maybe_on_grow_end(%Pool{on_grow_end: on_grow_end} = state, pid, result) do
+  defp maybe_on_grow_end(%Pool{on_grow_end: on_grow_end} = state, pid, result, boot_reason) do
     new_count = runner_count(state)
-    meta = %{count: new_count, name: state.name, pid: pid}
+    meta = %{count: new_count, name: state.name, pid: pid, reason: boot_reason}
 
     case result do
       :ok -> if on_grow_end, do: on_grow_end.(:ok, meta)
@@ -948,10 +1007,11 @@ defmodule FLAME.Pool do
     %{^ref => task_pid} = state.pending_runners
     Process.demonitor(ref, [:flush])
 
+    boot_reason = boot_reason(state, ref)
     new_state = %{state | pending_runners: Map.delete(state.pending_runners, ref)}
     {runner, new_state} = put_runner(new_state, pid)
-    new_state = maybe_on_grow_end(new_state, task_pid, :ok)
-    new_state = reply_grower(new_state, ref, {:ok, pid})
+    new_state = maybe_on_grow_end(new_state, task_pid, :ok, boot_reason)
+    new_state = new_state |> reply_grower(ref, {:ok, pid}) |> settle_restore(ref, :ok)
 
     # pop waiting callers up to max_concurrency, but we must handle:
     # 1. the case where we have no waiting callers
