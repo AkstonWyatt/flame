@@ -821,7 +821,7 @@ defmodule FLAME.Pool do
       state = %{state | restore_refs: MapSet.delete(state.restore_refs, ref)}
 
       case result do
-        :ok when map_size(state.runners) >= restore_floor(state) ->
+        :ok when map_size(state.runners) >= min(state.min, state.max) ->
           %{state | restore_delay: @async_boot_debounce}
 
         :ok ->
