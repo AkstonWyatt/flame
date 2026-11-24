@@ -104,36 +104,40 @@ defmodule FLAME.PoolGrowTest do
     # removes and kills its callers), then read a {:cancel, ref, pid, :catch}
     # one of those callers had already sent, and raised "expected to checkin
     # runner ... that does not exist", taking the whole pool down.
-    @tag runner: [min: 2, max: 2, max_concurrency: 2]
-    test "is ignored instead of crashing the pool", %{pool_pid: pool_pid} = config do
-      test_pid = self()
+    for reason <- [:catch, :ok] do
+      @tag runner: [min: 2, max: 2, max_concurrency: 2]
+      test "a late #{reason} is ignored instead of crashing the pool",
+           %{pool_pid: pool_pid} = config do
+        reason = unquote(reason)
+        test_pid = self()
 
-      caller =
-        spawn(fn ->
-          FLAME.call(config.test, fn ->
-            send(test_pid, :in_call)
-            Process.sleep(:infinity)
+        caller =
+          spawn(fn ->
+            FLAME.call(config.test, fn ->
+              send(test_pid, :in_call)
+              Process.sleep(:infinity)
+            end)
           end)
-        end)
 
-      assert_receive :in_call, 2000
+        assert_receive :in_call, 2000
 
-      %{callers: %{^caller => %{checkout_ref: ref, runner_ref: runner_ref}}, runners: runners} =
-        :sys.get_state(pool_pid)
+        %{callers: %{^caller => %{checkout_ref: ref, runner_ref: runner_ref}}, runners: runners} =
+          :sys.get_state(pool_pid)
 
-      %{pid: runner_pid} = Map.fetch!(runners, runner_ref)
+        %{pid: runner_pid} = Map.fetch!(runners, runner_ref)
 
-      # The runner's :DOWN lands in the mailbox ahead of the caller's cancel.
-      :sys.suspend(pool_pid)
-      Process.exit(runner_pid, :kill)
-      wait_for_down_queued(pool_pid, runner_ref)
-      send(pool_pid, {:cancel, ref, caller, :catch})
-      :sys.resume(pool_pid)
+        # The runner's :DOWN lands in the mailbox ahead of the caller's cancel.
+        :sys.suspend(pool_pid)
+        Process.exit(runner_pid, :kill)
+        wait_for_down_queued(pool_pid, runner_ref)
+        send(pool_pid, {:cancel, ref, caller, reason})
+        :sys.resume(pool_pid)
 
-      # Still the same pool process, and still serving calls.
-      assert :sys.get_state(pool_pid).callers == %{}
-      assert Process.whereis(config.test) == pool_pid
-      assert FLAME.call(config.test, fn -> :works end) == :works
+        # Still the same pool process, and still serving calls.
+        assert :sys.get_state(pool_pid).callers == %{}
+        assert Process.whereis(config.test) == pool_pid
+        assert FLAME.call(config.test, fn -> :works end) == :works
+      end
     end
 
     # The same race on a placement that succeeded: the caller's

@@ -37,6 +37,8 @@ defmodule FLAME.Pool do
   """
   use GenServer
 
+  require Logger
+
   alias FLAME.{Pool, Runner, Queue, CodeSync}
   alias FLAME.Pool.{RunnerState, WaitingState, Caller}
 
@@ -561,6 +563,7 @@ defmodule FLAME.Pool do
       # runner, so there is nothing to hand the slot to. Matching on the pid
       # alone keeps a stale ref for a pid with a newer lease on the old path.
       {:replace, _child_pids} when not is_map_key(state.callers, caller_pid) ->
+        log_late_cancel(state, caller_pid, :replace)
         {:noreply, state}
 
       {:replace, child_pids} ->
@@ -649,6 +652,15 @@ defmodule FLAME.Pool do
     %{state | callers: new_callers}
   end
 
+  # A warning, not a raise: the pool stays up, and the log shows how often a
+  # check-in races its runner going down.
+  defp log_late_cancel(%Pool{} = state, caller_pid, reason) do
+    Logger.warning(
+      "FLAME pool #{inspect(state.name)} ignored a #{inspect(reason)} check-in from " <>
+        "#{inspect(caller_pid)}: its runner had already gone down"
+    )
+  end
+
   defp checkin_runner(state, ref, caller_pid, reason)
        when is_reference(ref) and is_pid(caller_pid) do
     case state.callers do
@@ -668,6 +680,7 @@ defmodule FLAME.Pool do
       # 2026-11-24). Only when the pool holds no lease for this pid at all: a
       # stale ref for a pid with a newer lease still raises, as before.
       callers when reason in [:ok, :catch] and not is_map_key(callers, caller_pid) ->
+        log_late_cancel(state, caller_pid, reason)
         state
 
       %{} ->
