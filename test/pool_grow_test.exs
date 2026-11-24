@@ -261,20 +261,44 @@ defmodule FLAME.PoolGrowTest do
       assert runners(runner_sup) == [grown]
     end
 
+    # The floor runner never idles (restore stays on); a demand runner does. Kill
+    # the floor while the demand runner keeps the pool at min, then let the
+    # demand runner idle out: that exit is on purpose and is not replaced.
     @tag runner: [
            restore_min: true,
            min: 1,
            max: 2,
-           max_concurrency: 2,
-           min_idle_shutdown_after: 200,
+           max_concurrency: 1,
+           idle_shutdown_after: 300,
            on_grow_start: &__MODULE__.report_grow_start/1
          ]
     test "a runner that idled out on purpose is not replaced",
-         %{runner_sup: runner_sup} = config do
+         %{runner_sup: runner_sup, pool_pid: pool_pid} = config do
       listen(config)
-      [runner] = runners(runner_sup)
-      ref = Process.monitor(runner)
-      assert_receive {:DOWN, ^ref, :process, ^runner, {:shutdown, :idle}}, 2_000
+      assert :sys.get_state(pool_pid).restore_min?
+      [floor] = runners(runner_sup)
+
+      # hold the floor runner's only slot, so the next call boots on demand
+      parent = self()
+
+      {:ok, _holder} =
+        Task.start(fn ->
+          FLAME.call(config.test, fn ->
+            send(parent, :holding)
+            Process.sleep(:infinity)
+          end)
+        end)
+
+      assert_receive :holding, 2_000
+      assert FLAME.call(config.test, fn -> :demand end) == :demand
+      assert_receive {:grow_start, :demand}, 1_000
+      [demand] = runners(runner_sup) -- [floor]
+
+      Process.exit(floor, :kill)
+      wait_for(fn -> runners(runner_sup) == [demand] end)
+
+      ref = Process.monitor(demand)
+      assert_receive {:DOWN, ^ref, :process, ^demand, {:shutdown, :idle}}, 2_000
       # a restore would boot within the 1 s debounce and report it
       refute_receive {:grow_start, :restore}, 1_500
       assert runners(runner_sup) == []
@@ -318,6 +342,37 @@ defmodule FLAME.PoolGrowTest do
       [replacement] = runners(runner_sup)
       ref = Process.monitor(replacement)
       refute_receive {:DOWN, ^ref, :process, ^replacement, _}, 500
+    end
+  end
+
+  describe "max_concurrency :infinity" do
+    @tag runner: [restore_min: true, min: 1, max: 1, max_concurrency: :infinity]
+    test "a restore boots and the pool survives",
+         %{runner_sup: runner_sup, pool_pid: pool_pid} = config do
+      [victim] = runners(runner_sup)
+      Process.exit(victim, :kill)
+      wait_for(fn -> match?([pid] when pid != victim, runners(runner_sup)) end, 200)
+
+      assert Process.whereis(config.test) == pool_pid
+      assert FLAME.call(config.test, fn -> :works end) == :works
+      assert Process.whereis(config.test) == pool_pid
+    end
+
+    @tag runner: [min: 0, max: 1, max_concurrency: :infinity]
+    test "a demand boot from zero serves its callers", %{pool_pid: pool_pid} = config do
+      tasks = for i <- 1..3, do: Task.async(fn -> FLAME.call(config.test, fn -> i end) end)
+      assert Enum.map(tasks, &Task.await(&1, 5_000)) == [1, 2, 3]
+      assert Process.whereis(config.test) == pool_pid
+    end
+  end
+
+  describe "a min above max" do
+    @tag runner: [restore_min: true, min: 3, max: 1, max_concurrency: 2]
+    test "is restored only up to max", %{runner_sup: runner_sup} do
+      for pid <- runners(runner_sup), do: Process.exit(pid, :kill)
+      wait_for(fn -> length(runners(runner_sup)) == 1 end, 200)
+      Process.sleep(1_300)
+      assert length(runners(runner_sup)) == 1
     end
   end
 

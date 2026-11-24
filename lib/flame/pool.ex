@@ -670,7 +670,7 @@ defmodule FLAME.Pool do
 
       runner_count < state.max ->
         if state.async_boot_timer ||
-             map_size(state.pending_runners) * state.max_concurrency > waiting_count(state) do
+             pending_capacity(state) > waiting_count(state) do
           waiting_in(state, deadline, from)
         else
           state
@@ -779,7 +779,8 @@ defmodule FLAME.Pool do
   # failing is not asked for machines in a tight loop. A restore that comes up
   # with the pool back at `:min` resets it.
   defp schedule_restore_min(%Pool{} = state) do
-    if state.restore_min? and runner_count(state) < state.min and is_nil(state.restore_timer) do
+    if state.restore_min? and runner_count(state) < restore_floor(state) and
+         is_nil(state.restore_timer) do
       timer = Process.send_after(self(), :restore_min, state.restore_delay)
       %{state | restore_timer: timer}
     else
@@ -787,10 +788,13 @@ defmodule FLAME.Pool do
     end
   end
 
+  # A pool given a `:min` above its `:max` is restored only up to `:max`.
+  defp restore_floor(%Pool{} = state), do: min(state.min, state.max)
+
   # Boots only the deficit, counting pending boots, so the pool never passes
   # `:min` (and so never `:max`) through a restore.
   defp restore_min(%Pool{} = state) do
-    missing = state.min - runner_count(state)
+    missing = restore_floor(state) - runner_count(state)
 
     if missing > 0 do
       Enum.reduce(1..missing, state, fn _, acc ->
@@ -817,7 +821,7 @@ defmodule FLAME.Pool do
       state = %{state | restore_refs: MapSet.delete(state.restore_refs, ref)}
 
       case result do
-        :ok when map_size(state.runners) >= state.min ->
+        :ok when map_size(state.runners) >= restore_floor(state) ->
           %{state | restore_delay: @async_boot_debounce}
 
         :ok ->
@@ -1013,8 +1017,17 @@ defmodule FLAME.Pool do
   end
 
   defp has_unmet_servicable_demand?(%Pool{} = state) do
-    waiting_count(state) > map_size(state.pending_runners) * state.max_concurrency and
-      runner_count(state) < state.max
+    waiting_count(state) > pending_capacity(state) and runner_count(state) < state.max
+  end
+
+  # How many waiting callers the runners still booting will take. With an
+  # `:infinity` `:max_concurrency`, one pending runner takes them all.
+  defp pending_capacity(%Pool{max_concurrency: :infinity} = state) do
+    if map_size(state.pending_runners) > 0, do: :infinity, else: 0
+  end
+
+  defp pending_capacity(%Pool{} = state) do
+    map_size(state.pending_runners) * state.max_concurrency
   end
 
   defp handle_runner_async_up(%Pool{} = state, pid, ref) when is_pid(pid) and is_reference(ref) do
@@ -1032,7 +1045,9 @@ defmodule FLAME.Pool do
     # 2. the case where we process a DOWN for the new runner as we pop DOWNs
     #   looking for fresh waiting
     # 3. if we still have waiting callers at the end, boot more runners if we have capacity
-    Enum.reduce_while(1..state.max_concurrency, new_state, fn i, acc ->
+    # `Stream.iterate/2` rather than a range: `:max_concurrency` may be `:infinity`,
+    # and the `i <= acc.max_concurrency` check below bounds a finite one.
+    Enum.reduce_while(Stream.iterate(1, &(&1 + 1)), new_state, fn i, acc ->
       with {:ok, %RunnerState{} = runner} <- Map.fetch(acc.runners, runner.monitor_ref),
            true <- i <= acc.max_concurrency do
         case pop_next_waiting_caller(acc) do
