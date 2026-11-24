@@ -98,6 +98,45 @@ defmodule FLAME.PoolGrowTest do
     if :persistent_term.get({__MODULE__, :fail, meta.name}, false), do: raise("boom")
   end
 
+  describe "a check-in that races its runner going down" do
+    # Seen on staging 2026-11-24: a runner was stopped while callers were still
+    # using it. The pool handled the runner's :DOWN first (drop_child_runner
+    # removes and kills its callers), then read a {:cancel, ref, pid, :catch}
+    # one of those callers had already sent, and raised "expected to checkin
+    # runner ... that does not exist", taking the whole pool down.
+    @tag runner: [min: 2, max: 2, max_concurrency: 2]
+    test "is ignored instead of crashing the pool", %{pool_pid: pool_pid} = config do
+      test_pid = self()
+
+      caller =
+        spawn(fn ->
+          FLAME.call(config.test, fn ->
+            send(test_pid, :in_call)
+            Process.sleep(:infinity)
+          end)
+        end)
+
+      assert_receive :in_call, 2000
+
+      %{callers: %{^caller => %{checkout_ref: ref, runner_ref: runner_ref}}, runners: runners} =
+        :sys.get_state(pool_pid)
+
+      %{pid: runner_pid} = Map.fetch!(runners, runner_ref)
+
+      # The runner's :DOWN lands in the mailbox ahead of the caller's cancel.
+      :sys.suspend(pool_pid)
+      Process.exit(runner_pid, :kill)
+      wait_for(fn -> not Process.alive?(runner_pid) end)
+      send(pool_pid, {:cancel, ref, caller, :catch})
+      :sys.resume(pool_pid)
+
+      # Still the same pool process, and still serving calls.
+      assert :sys.get_state(pool_pid).callers == %{}
+      assert Process.whereis(config.test) == pool_pid
+      assert FLAME.call(config.test, fn -> :works end) == :works
+    end
+  end
+
   describe "grow/2" do
     @tag runner: [min: 1, max: 3, max_concurrency: 2]
     test "boots one more runner and replies with it", %{runner_sup: runner_sup} = config do

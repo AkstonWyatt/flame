@@ -654,6 +654,14 @@ defmodule FLAME.Pool do
       %{} when reason == :timeout ->
         maybe_drop_waiting(state, caller_pid)
 
+      # The caller's runner went down first: `drop_child_runner/2` already
+      # removed and killed it, and this check-in was in the mailbox before the
+      # kill. There is nothing left to check in. Raising here took the whole
+      # pool down whenever a runner stopped under load (seen on staging
+      # 2026-11-24).
+      %{} when reason in [:ok, :catch] ->
+        state
+
       %{} ->
         raise ArgumentError,
               "expected to checkin runner for #{inspect(caller_pid)} that does not exist"
