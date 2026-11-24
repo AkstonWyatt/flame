@@ -126,7 +126,7 @@ defmodule FLAME.PoolGrowTest do
       # The runner's :DOWN lands in the mailbox ahead of the caller's cancel.
       :sys.suspend(pool_pid)
       Process.exit(runner_pid, :kill)
-      wait_for(fn -> not Process.alive?(runner_pid) end)
+      wait_for_down_queued(pool_pid, runner_ref)
       send(pool_pid, {:cancel, ref, caller, :catch})
       :sys.resume(pool_pid)
 
@@ -135,6 +135,51 @@ defmodule FLAME.PoolGrowTest do
       assert Process.whereis(config.test) == pool_pid
       assert FLAME.call(config.test, fn -> :works end) == :works
     end
+
+    # The same race on a placement that succeeded: the caller's
+    # {:cancel, ref, pid, {:replace, [child]}} arrives after the runner's :DOWN,
+    # and `replace_caller/4` matched the removed checkout strictly.
+    @tag runner: [min: 2, max: 2, max_concurrency: 2]
+    test "a late placement replace is ignored too", %{pool_pid: pool_pid} = config do
+      test_pid = self()
+
+      caller =
+        spawn(fn ->
+          FLAME.call(config.test, fn ->
+            send(test_pid, :in_call)
+            Process.sleep(:infinity)
+          end)
+        end)
+
+      assert_receive :in_call, 2000
+
+      %{callers: %{^caller => %{checkout_ref: ref, runner_ref: runner_ref}}, runners: runners} =
+        :sys.get_state(pool_pid)
+
+      %{pid: runner_pid} = Map.fetch!(runners, runner_ref)
+      child = spawn(fn -> Process.sleep(:infinity) end)
+
+      :sys.suspend(pool_pid)
+      Process.exit(runner_pid, :kill)
+      wait_for_down_queued(pool_pid, runner_ref)
+      send(pool_pid, {:cancel, ref, caller, {:replace, [child]}})
+      :sys.resume(pool_pid)
+
+      assert :sys.get_state(pool_pid).callers == %{}
+      assert Process.whereis(config.test) == pool_pid
+      assert FLAME.call(config.test, fn -> :works end) == :works
+      Process.exit(child, :kill)
+    end
+  end
+
+  # Waits until the suspended pool's mailbox holds the :DOWN for this runner's
+  # monitor, so the message sent next is ordered after it. `Process.alive?/1`
+  # alone does not establish that order.
+  defp wait_for_down_queued(pool_pid, runner_ref) do
+    wait_for(fn ->
+      {:messages, messages} = Process.info(pool_pid, :messages)
+      Enum.any?(messages, &match?({:DOWN, ^runner_ref, :process, _, _}, &1))
+    end)
   end
 
   describe "grow/2" do

@@ -556,6 +556,13 @@ defmodule FLAME.Pool do
 
   def handle_info({:cancel, ref, caller_pid, reason}, state) do
     case reason do
+      # The caller's runner went down before this arrived: `drop_child_runner/2`
+      # already removed the checkout, and the placed children died with the
+      # runner, so there is nothing to hand the slot to. Matching on the pid
+      # alone keeps a stale ref for a pid with a newer lease on the old path.
+      {:replace, _child_pids} when not is_map_key(state.callers, caller_pid) ->
+        {:noreply, state}
+
       {:replace, child_pids} ->
         {:noreply, replace_caller(state, ref, caller_pid, child_pids)}
 
@@ -657,9 +664,10 @@ defmodule FLAME.Pool do
       # The caller's runner went down first: `drop_child_runner/2` already
       # removed and killed it, and this check-in was in the mailbox before the
       # kill. There is nothing left to check in. Raising here took the whole
-      # pool down whenever a runner stopped under load (seen on staging
-      # 2026-11-24).
-      %{} when reason in [:ok, :catch] ->
+      # pool down when a runner stopped under load (seen on staging
+      # 2026-11-24). Only when the pool holds no lease for this pid at all: a
+      # stale ref for a pid with a newer lease still raises, as before.
+      callers when reason in [:ok, :catch] and not is_map_key(callers, caller_pid) ->
         state
 
       %{} ->
