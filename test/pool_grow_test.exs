@@ -62,6 +62,8 @@ defmodule FLAME.PoolGrowTest do
     {:ok, runner_sup: runner_sup, pool_pid: Process.whereis(config.test)}
   end
 
+  def slow_grow_start(_meta), do: Process.sleep(300)
+
   # Sends the test process every growth callback, with its reason.
   def report_grow_start(meta) do
     if pid = :persistent_term.get({__MODULE__, :listener, meta.name}, nil),
@@ -113,6 +115,26 @@ defmodule FLAME.PoolGrowTest do
       ref = Process.monitor(pid)
       refute_receive {:DOWN, ^ref, :process, ^pid, _}, 500
       assert length(runners(runner_sup)) == 2
+    end
+
+    @tag runner: [
+           min: 1,
+           max: 2,
+           max_concurrency: 2,
+           on_grow_start: &__MODULE__.slow_grow_start/1
+         ]
+    test "a caller that goes away before the reply leaves the pool working",
+         %{runner_sup: runner_sup} = config do
+      caller = spawn(fn -> Pool.grow(config.test) end)
+      ref = Process.monitor(caller)
+      # the boot is held for 300 ms, so the caller dies while it is pending
+      Process.sleep(100)
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :killed}
+
+      wait_for(fn -> length(runners(runner_sup)) == 2 end)
+      assert Process.whereis(config.test) == config.pool_pid
+      assert FLAME.call(config.test, fn -> :works end) == :works
     end
 
     @tag runner: [min: 1, max: 1, max_concurrency: 2]
@@ -177,7 +199,41 @@ defmodule FLAME.PoolGrowTest do
   end
 
   describe "restoring min" do
-    @tag runner: [min: 2, max: 3, max_concurrency: 2]
+    @tag runner: [min: 1, max: 2, max_concurrency: 2]
+    test "is off unless the pool asks for it", %{runner_sup: runner_sup} do
+      [runner] = runners(runner_sup)
+      Process.exit(runner, :kill)
+      wait_for(fn -> runners(runner_sup) == [] end)
+      Process.sleep(1_300)
+      assert runners(runner_sup) == []
+    end
+
+    @tag runner: [restore_min: true, min: 3, max: 4, max_concurrency: 2]
+    test "replaces several runners that go down together", %{runner_sup: runner_sup} do
+      [a, b, c] = runners(runner_sup)
+      Process.exit(a, :kill)
+      Process.exit(b, :kill)
+
+      wait_for(fn ->
+        current = runners(runner_sup)
+        length(current) == 3 and a not in current and b not in current
+      end)
+
+      assert c in runners(runner_sup)
+      Process.sleep(1_300)
+      assert length(runners(runner_sup)) == 3
+    end
+
+    @tag runner: [restore_min: true, min: 1, max: 2, max_concurrency: 2, single_use: true]
+    test "single-use pools are never restored", %{runner_sup: runner_sup} do
+      [runner] = runners(runner_sup)
+      Process.exit(runner, :kill)
+      wait_for(fn -> runners(runner_sup) == [] end)
+      Process.sleep(1_300)
+      assert runners(runner_sup) == []
+    end
+
+    @tag runner: [restore_min: true, min: 2, max: 3, max_concurrency: 2]
     test "a running runner that goes down is replaced up to min",
          %{runner_sup: runner_sup} = config do
       [victim, survivor] = runners(runner_sup)
@@ -192,7 +248,7 @@ defmodule FLAME.PoolGrowTest do
       assert FLAME.call(config.test, fn -> :works end) == :works
     end
 
-    @tag runner: [min: 1, max: 3, max_concurrency: 2]
+    @tag runner: [restore_min: true, min: 1, max: 3, max_concurrency: 2]
     test "no replacement while the pool is still at or above min",
          %{runner_sup: runner_sup} = config do
       [first] = runners(runner_sup)
@@ -206,6 +262,7 @@ defmodule FLAME.PoolGrowTest do
     end
 
     @tag runner: [
+           restore_min: true,
            min: 1,
            max: 2,
            max_concurrency: 2,
@@ -224,6 +281,7 @@ defmodule FLAME.PoolGrowTest do
     end
 
     @tag runner: [
+           restore_min: true,
            min: 1,
            max: 2,
            max_concurrency: 2,
@@ -251,7 +309,7 @@ defmodule FLAME.PoolGrowTest do
       assert replacement != victim
     end
 
-    @tag runner: [min: 1, max: 2, max_concurrency: 2, idle_shutdown_after: 100]
+    @tag runner: [restore_min: true, min: 1, max: 2, max_concurrency: 2, idle_shutdown_after: 100]
     test "the replacement is not shut down as idle", %{runner_sup: runner_sup} do
       [victim] = runners(runner_sup)
       Process.exit(victim, :kill)

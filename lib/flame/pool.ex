@@ -66,6 +66,7 @@ defmodule FLAME.Pool do
             on_grow_end: nil,
             on_shrink: nil,
             async_boot_timer: nil,
+            restore_min?: false,
             restore_timer: nil,
             restore_delay: @async_boot_debounce,
             restore_refs: MapSet.new(),
@@ -141,6 +142,12 @@ defmodule FLAME.Pool do
 
     * `:min_idle_shutdown_after` - The same behavior of `:idle_shutdown_after`, but applied
       to the the `:min` pool runners. Defaults to `:infinity`.
+
+    * `:restore_min` - When `true`, a running runner that goes down unexpectedly and leaves
+      the pool below `:min` is replaced, with a growing pause between failed attempts.
+      Only applies when `:min_idle_shutdown_after` is `:infinity` and runners are not
+      `:single_use`, since those pools let their `:min` runners exit on purpose.
+      Defaults to `false`.
 
     * `:on_grow_start` - The optional function to be called when the pool starts booting a new
       runner beyond the configured `:min`. The function receives a map with the following metadata:
@@ -234,6 +241,7 @@ defmodule FLAME.Pool do
       :child_placement_sup,
       :idle_shutdown_after,
       :min_idle_shutdown_after,
+      :restore_min,
       :min,
       :max,
       :max_concurrency,
@@ -462,6 +470,10 @@ defmodule FLAME.Pool do
       boot_timeout: boot_timeout,
       idle_shutdown_after: Keyword.get(opts, :idle_shutdown_after, @idle_shutdown_after),
       min_idle_shutdown_after: Keyword.get(opts, :min_idle_shutdown_after, :infinity),
+      restore_min?:
+        Keyword.get(opts, :restore_min, false) and
+          Keyword.get(opts, :min_idle_shutdown_after, :infinity) == :infinity and
+          not Keyword.get(opts, :single_use, false),
       max_concurrency: Keyword.get(opts, :max_concurrency, @default_max_concurrency),
       on_grow_start: opts[:on_grow_start],
       on_grow_end: opts[:on_grow_end],
@@ -515,8 +527,10 @@ defmodule FLAME.Pool do
     {:noreply, handle_runner_async_up(state, pid, ref)}
   end
 
-  # A boot task that returned an error rather than crashing. Handled as the task
-  # going down: before this clause the reply matched no clause and crashed the pool.
+  # A boot task that returned an error rather than crashing, handled as the task
+  # going down. Defensive: a backend error today stops the runner and the boot task
+  # crashes, so this arrives only if that changes; without it the reply would match
+  # no clause and crash the pool.
   def handle_info({ref, {:error, reason}}, %Pool{} = state)
       when is_reference(ref) and is_map_key(state.pending_runners, ref) do
     Process.demonitor(ref, [:flush])
@@ -765,7 +779,7 @@ defmodule FLAME.Pool do
   # failing is not asked for machines in a tight loop. A restore that comes up
   # with the pool back at `:min` resets it.
   defp schedule_restore_min(%Pool{} = state) do
-    if runner_count(state) < state.min and is_nil(state.restore_timer) do
+    if state.restore_min? and runner_count(state) < state.min and is_nil(state.restore_timer) do
       timer = Process.send_after(self(), :restore_min, state.restore_delay)
       %{state | restore_timer: timer}
     else
