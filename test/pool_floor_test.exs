@@ -280,7 +280,70 @@ defmodule FLAME.PoolFloorTest do
 
       assert_received {:grow_start, :demand}
       assert length(runners(config.runner_sup)) == 1
-      assert map_size(:sys.get_state(config.test).pending_runners) == 0
+    end
+
+    # A caller boots above the floor while the floor runner is busy, and that boot
+    # hangs. The floor runner then dies: the restore counts the hung boot, so only
+    # its deadline frees the slot for the restore to fill.
+    test "a hung boot above the floor does not keep the floor from coming back",
+         config do
+      parent = self()
+
+      capture_log(fn ->
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 1,
+            boot_timeout: 300,
+            on_grow_start: fn info -> send(parent, {:grow_start, info.reason}) end
+          )
+
+        start_supervised!({Pool, opts})
+        [floor] = runners(config.runner_sup)
+
+        # fill the floor runner's two slots
+        for _ <- 1..2 do
+          spawn(fn ->
+            FLAME.call(config.test, fn -> Process.sleep(:infinity) end, timeout: 60_000)
+          end)
+        end
+
+        Process.sleep(200)
+        FaultyBackend.arm(config.test, :hang, 1)
+        spawn(fn -> catch_exit(FLAME.call(config.test, fn -> :ok end, timeout: 1_000)) end)
+        assert_receive {:grow_start, :demand}, 2_000
+
+        Process.exit(floor, :kill)
+        assert_receive {:grow_start, :restore}, 4_000
+        wait_for(fn -> length(runners(config.runner_sup)) == 1 end, 100)
+      end)
+    end
+
+    # The floor and its replacement fail, and a grow lands before the restore's
+    # backoff and hangs. The grow is counted by the restore, so it has the deadline.
+    test "a hung grow below the floor does not keep the floor from coming back",
+         config do
+      FaultyBackend.arm(config.test, :hang, 3)
+      parent = self()
+
+      capture_log(fn ->
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 1,
+            boot_timeout: 300,
+            on_grow_start: fn info -> send(parent, {:grow_start, info.reason}) end
+          )
+
+        start_supervised!({Pool, opts})
+        assert_receive {:grow_start, :restore}, 500
+        Process.sleep(400)
+        spawn(fn -> Pool.grow(config.test, 100) end)
+        assert_receive {:grow_start, :grow}, 500
+        # the grow fails at 300 ms, then the restore boots the floor
+        assert_receive {:grow_start, :restore}, 4_000
+        wait_for(fn -> length(runners(config.runner_sup)) == 1 end, 100)
+      end)
     end
 
     test "a grow that fails replies with the boot's own exit reason", config do

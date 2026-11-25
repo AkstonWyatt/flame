@@ -154,7 +154,9 @@ defmodule FLAME.Pool do
       `:single_use`, since those pools let their `:min` runners exit on purpose.
       Such a pool also starts when some of its `:min` runners fail to boot or outlast
       `:boot_timeout`: those runners are stopped, an error is logged, and the restore
-      boots the missing runners in the background. Defaults to `false`.
+      boots the missing runners in the background. Every boot in such a pool, demand
+      and `grow/2` included, is stopped once the whole boot outlasts `:boot_timeout`.
+      Defaults to `false`.
 
     * `:on_min_short` - The optional 1-arity function called when a `:restore_min` pool
       starts with fewer than `:min` runners. It runs inside the pool's `init/1`, and
@@ -903,26 +905,23 @@ defmodule FLAME.Pool do
   # A demand boot while a `:restore_min` pool is below `:min` fills a missing
   # `:min` runner, so it is booted as one: it does not idle out, and the restore,
   # which counts it, never has to put the slot back.
-  # That stand-in also gets the floor's deadline: it holds the slot the restore
-  # would fill, and the restore counts it, so a stand-in that never answers would
-  # leave the floor short with no restore scheduled.
   defp async_boot_runner(%Pool{} = state) do
-    {_ref, state} =
+    runner_opts =
       if state.restore_min? and runner_count(state) < restore_floor(state),
-        do: start_async_boot(state, floor_runner_opts(state), :demand, state.boot_timeout),
-        else: start_async_boot(state, [], :demand)
+        do: floor_runner_opts(state),
+        else: []
 
+    {_ref, state} = start_async_boot(state, runner_opts, :demand)
     state
   end
 
   defp start_async_boot(
          %Pool{on_grow_start: on_grow_start, name: name} = state,
          runner_opts,
-         reason,
-         deadline \\ :by_reason
+         reason
        ) do
     new_count = runner_count(state) + 1
-    deadline = if deadline == :by_reason, do: boot_deadline(state, reason), else: deadline
+    deadline = boot_deadline(state)
 
     task =
       Task.Supervisor.async_nolink(state.task_sup, fn ->
@@ -936,12 +935,13 @@ defmodule FLAME.Pool do
     {task.ref, %{state | pending_runners: new_pending}}
   end
 
-  # A restore boot gets the floor boot's deadline, so a backend that never answers
-  # fails the boot and the restore retries it, instead of holding the slot.
-  # Grow boots and demand boots above the floor keep upstream's unbounded wait
-  # (a demand boot below the floor is given the deadline in `async_boot_runner/1`).
-  defp boot_deadline(%Pool{} = state, :restore), do: state.boot_timeout
-  defp boot_deadline(%Pool{}, _reason), do: nil
+  # In a `:restore_min` pool every boot gets the floor boot's deadline. The restore
+  # counts pending boots of any kind, so one that never answers would hold a slot
+  # the restore thinks is filled, and the floor would stay short with no restore
+  # scheduled. Failed, it frees the slot and the restore boots it again. Other
+  # pools keep upstream's unbounded wait.
+  defp boot_deadline(%Pool{restore_min?: true} = state), do: state.boot_timeout
+  defp boot_deadline(%Pool{}), do: nil
 
   # A runner that stands in for a `:min` runner is booted the way `boot_runners/1`
   # boots them, so it is not shut down as idle before work is placed on it.
