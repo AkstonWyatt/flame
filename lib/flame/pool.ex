@@ -546,9 +546,8 @@ defmodule FLAME.Pool do
   end
 
   # A boot task that returned an error rather than crashing, handled as the task
-  # going down. Defensive: a backend error today stops the runner and the boot task
-  # crashes, so this arrives only if that changes; without it the reply would match
-  # no clause and crash the pool.
+  # going down with that reason. `start_child_runner/3` catches a boot's exit and
+  # returns it here, so every failed demand, grow and restore boot arrives this way.
   def handle_info({ref, {:error, reason}}, %Pool{} = state)
       when is_reference(ref) and is_map_key(state.pending_runners, ref) do
     Process.demonitor(ref, [:flush])
@@ -785,6 +784,11 @@ defmodule FLAME.Pool do
 
         {:exit, reason}, _acc ->
           raise "failed to boot runner: #{inspect(reason)}"
+
+        # A boot that exited, caught by `start_child_runner/3`. The reason is left
+        # out: a backend's error can carry credentials.
+        {:ok, {:error, _reason}}, _acc ->
+          raise "failed to boot runner"
       end)
     else
       state
@@ -921,12 +925,18 @@ defmodule FLAME.Pool do
         if on_grow_start,
           do: on_grow_start.(%{count: new_count, name: name, pid: self(), reason: reason})
 
-        start_child_runner(state, runner_opts)
+        start_child_runner(state, runner_opts, boot_deadline(state, reason))
       end)
 
     new_pending = Map.put(state.pending_runners, task.ref, task.pid)
     {task.ref, %{state | pending_runners: new_pending}}
   end
+
+  # A restore boot gets the floor boot's deadline, so a backend that never answers
+  # fails the boot and the restore retries it, instead of holding the slot.
+  # Demand and grow boots keep upstream's unbounded wait.
+  defp boot_deadline(%Pool{} = state, :restore), do: state.boot_timeout
+  defp boot_deadline(%Pool{}, _reason), do: nil
 
   # A runner that stands in for a `:min` runner is booted the way `boot_runners/1`
   # boots them, so it is not shut down as idle before work is placed on it.
@@ -996,7 +1006,7 @@ defmodule FLAME.Pool do
     end
   end
 
-  defp start_child_runner(%Pool{} = state, runner_opts) do
+  defp start_child_runner(%Pool{} = state, runner_opts, timeout \\ nil) do
     opts = Keyword.merge(state.runner_opts, runner_opts)
     name = Module.concat(state.name, "Runner#{map_size(state.runners) + 1}")
 
@@ -1009,12 +1019,18 @@ defmodule FLAME.Pool do
     {:ok, pid} = DynamicSupervisor.start_child(state.runner_sup, spec)
 
     try do
-      case Runner.remote_boot(pid, state.base_sync_stream) do
+      case Runner.remote_boot(pid, state.base_sync_stream, timeout) do
         :ok -> {:ok, pid}
         {:error, reason} -> {:error, reason}
       end
     catch
-      :exit, reason -> {:error, {:exit, reason}}
+      # Caught, so the boot task returns the reason rather than crashing with it
+      # (a crash report would print it). The reason is passed on unwrapped, as
+      # the task's exit used to carry it. A runner still booting past the
+      # deadline is stopped, so no machine is left behind.
+      :exit, reason ->
+        _ = DynamicSupervisor.terminate_child(state.runner_sup, pid)
+        {:error, reason}
     end
   end
 

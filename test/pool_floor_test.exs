@@ -67,7 +67,8 @@ defmodule FLAME.PoolFloorTest do
     Keyword.merge(
       [
         name: config.test,
-        backend: {FaultyBackend, fault_key: config.test},
+        # the token stands in for the app key a real backend carries
+        backend: {FaultyBackend, fault_key: config.test, token: "SECRET_CANARY"},
         max: 4,
         max_concurrency: 2
       ],
@@ -176,15 +177,68 @@ defmodule FLAME.PoolFloorTest do
     test "boots the missing runners at once, so a caller does not take their place",
          config do
       FaultyBackend.arm(config.test, :fail, 1)
+      parent = self()
 
       capture_log(fn ->
-        opts = pool_opts(config, restore_min: true, min: 1, idle_shutdown_after: 100)
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 1,
+            idle_shutdown_after: 100,
+            on_grow_start: fn info -> send(parent, {:grow_start, info.reason}) end
+          )
+
         start_supervised!({Pool, opts})
+        # before the restore's 1 s debounce would have fired, and before any call
+        assert_receive {:grow_start, :restore}, 500
         assert FLAME.call(config.test, fn -> :works end) == :works
       end)
 
+      refute_received {:grow_start, :demand}
+
       Process.sleep(600)
       assert length(runners(config.runner_sup)) == 1
+    end
+
+    # The floor boot and its immediate replacement both fail. Neither the
+    # pool's line nor a boot task's crash report carries the backend's reason.
+    test "never logs a failed boot's reason, the replacement's included", config do
+      FaultyBackend.arm(config.test, :fail, 2)
+
+      log =
+        capture_log(fn ->
+          start_supervised!({Pool, pool_opts(config, restore_min: true, min: 1)})
+          wait_for(fn -> length(runners(config.runner_sup)) == 1 end, 250)
+        end)
+
+      assert log =~ "started with 0 of 1 min runners"
+      refute log =~ "SECRET_CANARY"
+    end
+
+    # The floor hangs, then its replacement hangs: the replacement has the floor's
+    # deadline, so it fails, and the next restore fills the floor.
+    test "a replacement that never answers is stopped and retried", config do
+      FaultyBackend.arm(config.test, :hang, 2)
+
+      capture_log(fn ->
+        opts = pool_opts(config, restore_min: true, min: 1, boot_timeout: 300)
+        start_supervised!({Pool, opts})
+        # waits on the pending restore: 300 ms hung, a 2 s backoff, then a boot
+        assert FLAME.call(config.test, fn -> :works end, timeout: 10_000) == :works
+      end)
+
+      # the hung runners were stopped, not left booting beside the one that works
+      assert length(runners(config.runner_sup)) == 1
+    end
+
+    test "a grow that fails replies with the boot's own exit reason", config do
+      FaultyBackend.arm(config.test, :fail, 1)
+      start_supervised!({Pool, pool_opts(config, restore_min: true, min: 0)})
+
+      capture_log(fn ->
+        assert {:error, {{:shutdown, {:unavailable, _}}, {GenServer, :call, _}}} =
+                 Pool.grow(config.test)
+      end)
     end
 
     test "counts a backend that returns a timeout as a timeout", config do
@@ -238,7 +292,11 @@ defmodule FLAME.PoolFloorTest do
       FaultyBackend.arm(config.test, :fail, 1)
 
       capture_log(fn ->
-        assert {:error, _reason} = start_supervised({Pool, pool_opts(config, min: 2)})
+        assert {:error, {{:shutdown, {:failed_to_start_child, _id, failure}}, _child_spec}} =
+                 start_supervised({Pool, pool_opts(config, min: 2)})
+
+        # the child spec, which ExUnit adds, carries the options; the failure must not
+        refute inspect(failure) =~ "SECRET_CANARY"
       end)
     end
   end
