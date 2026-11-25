@@ -216,19 +216,71 @@ defmodule FLAME.PoolFloorTest do
     end
 
     # The floor hangs, then its replacement hangs: the replacement has the floor's
-    # deadline, so it fails, and the next restore fills the floor.
-    test "a replacement that never answers is stopped and retried", config do
+    # deadline, so it fails. The waiting caller's demand boot, after the 1 s
+    # demand debounce and before the 2 s restore backoff, fills the floor.
+    test "a replacement that never answers is stopped, and a caller still gets a runner",
+         config do
       FaultyBackend.arm(config.test, :hang, 2)
 
       capture_log(fn ->
         opts = pool_opts(config, restore_min: true, min: 1, boot_timeout: 300)
         start_supervised!({Pool, opts})
-        # waits on the pending restore: 300 ms hung, a 2 s backoff, then a boot
         assert FLAME.call(config.test, fn -> :works end, timeout: 10_000) == :works
       end)
 
       # the hung runners were stopped, not left booting beside the one that works
       assert length(runners(config.runner_sup)) == 1
+    end
+
+    # With no caller, nothing but the restore can fill the floor: the hung
+    # replacement fails at the deadline and a second restore boots it.
+    test "a replacement that never answers is retried by the restore", config do
+      FaultyBackend.arm(config.test, :hang, 2)
+      parent = self()
+
+      capture_log(fn ->
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 1,
+            boot_timeout: 300,
+            on_grow_start: fn info -> send(parent, {:grow_start, info.reason}) end
+          )
+
+        start_supervised!({Pool, opts})
+        assert_receive {:grow_start, :restore}, 500
+        # 300 ms hung, then the 2 s backoff
+        assert_receive {:grow_start, :restore}, 4_000
+        wait_for(fn -> length(runners(config.runner_sup)) == 1 end, 100)
+      end)
+
+      refute_received {:grow_start, :demand}
+    end
+
+    # The floor, its replacement and the waiting caller's demand boot all hang.
+    # The demand boot stands in for the floor runner, so the restore counts it
+    # and schedules nothing: without the floor's deadline it would hold the slot
+    # forever and the floor would never come back.
+    test "a demand boot standing in for the floor gets the floor's deadline", config do
+      FaultyBackend.arm(config.test, :hang, 3)
+      parent = self()
+
+      capture_log(fn ->
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 1,
+            boot_timeout: 300,
+            on_grow_start: fn info -> send(parent, {:grow_start, info.reason}) end
+          )
+
+        start_supervised!({Pool, opts})
+        assert FLAME.call(config.test, fn -> :works end, timeout: 10_000) == :works
+      end)
+
+      assert_received {:grow_start, :demand}
+      assert length(runners(config.runner_sup)) == 1
+      assert map_size(:sys.get_state(config.test).pending_runners) == 0
     end
 
     test "a grow that fails replies with the boot's own exit reason", config do

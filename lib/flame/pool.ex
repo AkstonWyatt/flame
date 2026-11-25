@@ -903,29 +903,33 @@ defmodule FLAME.Pool do
   # A demand boot while a `:restore_min` pool is below `:min` fills a missing
   # `:min` runner, so it is booted as one: it does not idle out, and the restore,
   # which counts it, never has to put the slot back.
+  # That stand-in also gets the floor's deadline: it holds the slot the restore
+  # would fill, and the restore counts it, so a stand-in that never answers would
+  # leave the floor short with no restore scheduled.
   defp async_boot_runner(%Pool{} = state) do
-    runner_opts =
+    {_ref, state} =
       if state.restore_min? and runner_count(state) < restore_floor(state),
-        do: floor_runner_opts(state),
-        else: []
+        do: start_async_boot(state, floor_runner_opts(state), :demand, state.boot_timeout),
+        else: start_async_boot(state, [], :demand)
 
-    {_ref, state} = start_async_boot(state, runner_opts, :demand)
     state
   end
 
   defp start_async_boot(
          %Pool{on_grow_start: on_grow_start, name: name} = state,
          runner_opts,
-         reason
+         reason,
+         deadline \\ :by_reason
        ) do
     new_count = runner_count(state) + 1
+    deadline = if deadline == :by_reason, do: boot_deadline(state, reason), else: deadline
 
     task =
       Task.Supervisor.async_nolink(state.task_sup, fn ->
         if on_grow_start,
           do: on_grow_start.(%{count: new_count, name: name, pid: self(), reason: reason})
 
-        start_child_runner(state, runner_opts, boot_deadline(state, reason))
+        start_child_runner(state, runner_opts, deadline)
       end)
 
     new_pending = Map.put(state.pending_runners, task.ref, task.pid)
@@ -934,7 +938,8 @@ defmodule FLAME.Pool do
 
   # A restore boot gets the floor boot's deadline, so a backend that never answers
   # fails the boot and the restore retries it, instead of holding the slot.
-  # Demand and grow boots keep upstream's unbounded wait.
+  # Grow boots and demand boots above the floor keep upstream's unbounded wait
+  # (a demand boot below the floor is given the deadline in `async_boot_runner/1`).
   defp boot_deadline(%Pool{} = state, :restore), do: state.boot_timeout
   defp boot_deadline(%Pool{}, _reason), do: nil
 
