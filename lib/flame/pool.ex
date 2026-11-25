@@ -149,7 +149,9 @@ defmodule FLAME.Pool do
       the pool below `:min` is replaced, with a growing pause between failed attempts.
       Only applies when `:min_idle_shutdown_after` is `:infinity` and runners are not
       `:single_use`, since those pools let their `:min` runners exit on purpose.
-      Defaults to `false`.
+      Such a pool also starts when some of its `:min` runners fail to boot or outlast
+      `:boot_timeout`: those runners are stopped, an error is logged, and the restore
+      boots the missing runners in the background. Defaults to `false`.
 
     * `:on_grow_start` - The optional function to be called when the pool starts booting a new
       runner beyond the configured `:min`. The function receives a map with the following metadata:
@@ -742,6 +744,15 @@ defmodule FLAME.Pool do
     %{state | waiting: Queue.insert(state.waiting, waiting, pid)}
   end
 
+  # A pool that restores its `:min` does not need the whole floor to start. A floor
+  # runner that fails or outlasts `:boot_timeout` is stopped, the pool starts with
+  # the runners that came up, and the restore boots the rest in the background.
+  # Without `:restore_min` nothing would refill the floor, so those pools keep the
+  # strict start below.
+  defp boot_runners(%Pool{restore_min?: true, min: min} = state) when min > 0 do
+    boot_floor_tolerant(state)
+  end
+
   defp boot_runners(%Pool{} = state) do
     if state.min > 0 do
       # start min runners, and do not idle them down regardless of idle configuration
@@ -765,6 +776,76 @@ defmodule FLAME.Pool do
       state
     end
   end
+
+  # The runners are started here, in the pool, so the pool holds every pid and can
+  # stop the ones whose boot did not finish: a boot task killed on timeout leaves
+  # its runner booting, and a runner nobody tracks would keep its machine forever.
+  # The boots run in unlinked tasks, so a boot that exits (a dropped connection)
+  # or times out returns a result instead of taking `init/1` down with it.
+  # Starting a runner locally (the backend's `init`) still fails the start, as a
+  # configuration error should.
+  defp boot_floor_tolerant(%Pool{} = state) do
+    floor = state.min
+    opts = Keyword.merge(state.runner_opts, floor_runner_opts(state))
+
+    pids =
+      for i <- 1..floor//1 do
+        spec = %{
+          id: Module.concat(state.name, "Runner#{i}"),
+          start: {FLAME.Runner, :start_link, [opts]},
+          restart: :temporary
+        }
+
+        {:ok, pid} = DynamicSupervisor.start_child(state.runner_sup, spec)
+        pid
+      end
+
+    {state, failures} =
+      state.task_sup
+      |> Task.Supervisor.async_stream_nolink(
+        pids,
+        &boot_floor_runner(&1, state.base_sync_stream),
+        max_concurrency: 10,
+        timeout: state.boot_timeout,
+        on_timeout: :kill_task
+      )
+      |> Enum.zip(pids)
+      |> Enum.reduce({state, []}, fn
+        {{:ok, :ok}, pid}, {acc, failures} ->
+          {_runner, acc} = put_runner(acc, pid)
+          {acc, failures}
+
+        {result, pid}, {acc, failures} ->
+          _ = DynamicSupervisor.terminate_child(state.runner_sup, pid)
+          {acc, [failure_kind(result) | failures]}
+      end)
+
+    if failures != [] do
+      # Only the kind of failure is logged, never the reason: a backend's error
+      # can carry request headers, and those can hold credentials.
+      Logger.error(
+        "#{inspect(state.name)} started with #{map_size(state.runners)} of #{floor} min runners; " <>
+          "#{length(failures)} failed to boot (#{failures |> Enum.reverse() |> Enum.join(", ")}), " <>
+          "restoring min in the background"
+      )
+    end
+
+    schedule_restore_min(state)
+  end
+
+  # A boot that exits is caught here rather than left to crash its task: the
+  # task's crash report would print the exit reason.
+  defp boot_floor_runner(pid, base_sync_stream) do
+    Runner.remote_boot(pid, base_sync_stream)
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
+  end
+
+  defp failure_kind({:exit, :timeout}), do: "timeout"
+  defp failure_kind({:exit, _reason}), do: "exit"
+  defp failure_kind({:ok, {:error, {:exit, _reason}}}), do: "exit"
+  defp failure_kind({:ok, {:error, _reason}}), do: "error"
+  defp failure_kind(_other), do: "unexpected"
 
   defp schedule_async_boot_runner(%Pool{} = state) do
     if state.async_boot_timer, do: Process.cancel_timer(state.async_boot_timer)
