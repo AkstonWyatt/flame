@@ -69,6 +69,8 @@ defmodule FLAME.Pool do
             on_shrink: nil,
             async_boot_timer: nil,
             restore_min?: false,
+            strict_min_boot?: false,
+            on_min_short: nil,
             restore_timer: nil,
             restore_delay: @async_boot_debounce,
             restore_refs: MapSet.new(),
@@ -152,6 +154,19 @@ defmodule FLAME.Pool do
       Such a pool also starts when some of its `:min` runners fail to boot or outlast
       `:boot_timeout`: those runners are stopped, an error is logged, and the restore
       boots the missing runners in the background. Defaults to `false`.
+
+    * `:strict_min_boot` - When `true`, a `:restore_min` pool fails its start when a
+      `:min` runner fails to boot, as a pool without `:restore_min` does. For a caller
+      that would rather fall back to other options than run short. Defaults to `false`.
+
+    * `:on_min_short` - The optional 1-arity function called when a `:restore_min` pool
+      starts with fewer than `:min` runners. It runs inside the pool's `init/1`, and
+      anything it raises is logged and ignored. It receives a map with:
+
+        * `:name` - The name of the pool
+        * `:count` - The number of runners that booted
+        * `:min` - The configured `:min`
+        * `:failures` - One of `:timeout` or `:exit` per runner that did not boot
 
     * `:on_grow_start` - The optional function to be called when the pool starts booting a new
       runner beyond the configured `:min`. The function receives a map with the following metadata:
@@ -246,6 +261,8 @@ defmodule FLAME.Pool do
       :idle_shutdown_after,
       :min_idle_shutdown_after,
       :restore_min,
+      :strict_min_boot,
+      :on_min_short,
       :min,
       :max,
       :max_concurrency,
@@ -479,6 +496,8 @@ defmodule FLAME.Pool do
           Keyword.get(opts, :min_idle_shutdown_after, :infinity) == :infinity and
           not Keyword.get(opts, :single_use, false),
       max_concurrency: Keyword.get(opts, :max_concurrency, @default_max_concurrency),
+      strict_min_boot?: Keyword.get(opts, :strict_min_boot, false),
+      on_min_short: opts[:on_min_short],
       on_grow_start: opts[:on_grow_start],
       on_grow_end: opts[:on_grow_end],
       on_shrink: opts[:on_shrink],
@@ -749,7 +768,8 @@ defmodule FLAME.Pool do
   # the runners that came up, and the restore boots the rest in the background.
   # Without `:restore_min` nothing would refill the floor, so those pools keep the
   # strict start below.
-  defp boot_runners(%Pool{restore_min?: true, min: min} = state) when min > 0 do
+  defp boot_runners(%Pool{restore_min?: true, strict_min_boot?: false, min: min} = state)
+       when min > 0 do
     boot_floor_tolerant(state)
   end
 
@@ -809,7 +829,9 @@ defmodule FLAME.Pool do
         timeout: state.boot_timeout,
         on_timeout: :kill_task
       )
-      |> Enum.zip(pids)
+      # Lazily, so a runner whose boot failed is stopped as its result arrives
+      # rather than after the whole floor has been waited on.
+      |> Stream.zip(pids)
       |> Enum.reduce({state, []}, fn
         {{:ok, :ok}, pid}, {acc, failures} ->
           {_runner, acc} = put_runner(acc, pid)
@@ -820,17 +842,42 @@ defmodule FLAME.Pool do
           {acc, [failure_kind(result) | failures]}
       end)
 
-    if failures != [] do
-      # Only the kind of failure is logged, never the reason: a backend's error
-      # can carry request headers, and those can hold credentials.
+    if failures == [] do
+      state
+    else
+      failures = Enum.reverse(failures)
+
+      # This line carries only the kind of each failure, never its reason: a
+      # backend's error can carry request headers, and those can hold
+      # credentials. A Runner that crashes logs its own report, outside this.
       Logger.error(
         "#{inspect(state.name)} started with #{map_size(state.runners)} of #{floor} min runners; " <>
-          "#{length(failures)} failed to boot (#{failures |> Enum.reverse() |> Enum.join(", ")}), " <>
+          "#{length(failures)} failed to boot (#{Enum.join(failures, ", ")}), " <>
           "restoring min in the background"
       )
-    end
 
-    schedule_restore_min(state)
+      notify_min_short(state, failures)
+
+      # Booted now rather than after the restore's debounce: a demand boot in that
+      # window would take the missing slot as an idling runner, and when it idled
+      # out nothing would put the floor runner back.
+      restore_min(state)
+    end
+  end
+
+  defp notify_min_short(%Pool{on_min_short: nil}, _failures), do: :ok
+
+  defp notify_min_short(%Pool{on_min_short: callback} = state, failures) do
+    callback.(%{
+      name: state.name,
+      count: map_size(state.runners),
+      min: state.min,
+      failures: failures
+    })
+  rescue
+    error -> Logger.error("on_min_short raised #{inspect(error.__struct__)}")
+  catch
+    kind, _reason -> Logger.error("on_min_short failed with #{kind}")
   end
 
   # A boot that exits is caught here rather than left to crash its task: the
@@ -841,11 +888,10 @@ defmodule FLAME.Pool do
     :exit, reason -> {:error, {:exit, reason}}
   end
 
-  defp failure_kind({:exit, :timeout}), do: "timeout"
-  defp failure_kind({:exit, _reason}), do: "exit"
-  defp failure_kind({:ok, {:error, {:exit, _reason}}}), do: "exit"
-  defp failure_kind({:ok, {:error, _reason}}), do: "error"
-  defp failure_kind(_other), do: "unexpected"
+  # The pool's own deadline, or the backend's or Runner's deadline reached first.
+  defp failure_kind({:exit, :timeout}), do: :timeout
+  defp failure_kind({:ok, {:error, {:exit, {:timeout, _call}}}}), do: :timeout
+  defp failure_kind(_result), do: :exit
 
   defp schedule_async_boot_runner(%Pool{} = state) do
     if state.async_boot_timer, do: Process.cancel_timer(state.async_boot_timer)

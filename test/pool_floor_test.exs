@@ -7,8 +7,8 @@ defmodule FLAME.PoolFloorTest.FaultyBackend do
   alias FLAME.LocalBackend
 
   def arm(key, mode, n) when mode in [:fail, :hang] do
-    ref = :counters.new(1, [:atomics])
-    :counters.put(ref, 1, n)
+    ref = :atomics.new(1, signed: true)
+    :atomics.put(ref, 1, n)
     :persistent_term.put({__MODULE__, key}, {mode, ref})
   end
 
@@ -27,8 +27,8 @@ defmodule FLAME.PoolFloorTest.FaultyBackend do
   def remote_boot(state) do
     case :persistent_term.get({__MODULE__, state.fault_key}, nil) do
       {mode, ref} ->
-        if :counters.get(ref, 1) > 0 do
-          :counters.sub(ref, 1, 1)
+        # Claimed in one step: the floor boots its runners concurrently.
+        if :atomics.sub_get(ref, 1, 1) >= 0 do
           fault(mode, state)
         else
           LocalBackend.remote_boot(state)
@@ -99,7 +99,6 @@ defmodule FLAME.PoolFloorTest do
       log =
         capture_log(fn ->
           start_supervised!({Pool, pool_opts(config, restore_min: true, min: 3)})
-          assert length(runners(config.runner_sup)) == 2
           wait_for(fn -> length(runners(config.runner_sup)) == 3 end)
         end)
 
@@ -119,12 +118,11 @@ defmodule FLAME.PoolFloorTest do
         capture_log(fn ->
           opts = pool_opts(config, restore_min: true, min: 2, boot_timeout: 300)
           start_supervised!({Pool, opts})
-          # the hung runner is gone, not left booting outside the pool
-          assert length(runners(config.runner_sup)) == 1
           wait_for(fn -> length(runners(config.runner_sup)) == 2 end)
         end)
 
       assert log =~ "started with 1 of 2 min runners; 1 failed to boot (timeout)"
+      # the hung runner was stopped, not left booting beside its replacement
       Process.sleep(1_300)
       assert length(runners(config.runner_sup)) == 2
       assert FLAME.call(config.test, fn -> :works end) == :works
@@ -135,11 +133,58 @@ defmodule FLAME.PoolFloorTest do
 
       capture_log(fn ->
         start_supervised!({Pool, pool_opts(config, restore_min: true, min: 2)})
-        assert runners(config.runner_sup) == []
         wait_for(fn -> length(runners(config.runner_sup)) == 2 end)
       end)
 
       assert FLAME.call(config.test, fn -> :works end) == :works
+    end
+
+    test "tells on_min_short how many runners booted and why the rest did not", config do
+      FaultyBackend.arm(config.test, :fail, 2)
+      parent = self()
+
+      capture_log(fn ->
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 3,
+            on_min_short: fn info -> send(parent, {:short, info}) end
+          )
+
+        start_supervised!({Pool, opts})
+      end)
+
+      assert_received {:short, %{name: name, count: 1, min: 3, failures: [:exit, :exit]}}
+      assert name == config.test
+    end
+
+    test "a failing on_min_short does not stop the start", config do
+      FaultyBackend.arm(config.test, :fail, 1)
+
+      log =
+        capture_log(fn ->
+          opts = pool_opts(config, restore_min: true, min: 1, on_min_short: fn _ -> raise "x" end)
+          start_supervised!({Pool, opts})
+          wait_for(fn -> length(runners(config.runner_sup)) == 1 end)
+        end)
+
+      assert log =~ "on_min_short raised RuntimeError"
+    end
+
+    # A demand boot right after a short start would otherwise take the missing
+    # slot as a runner that idles out, and nothing would put the floor back.
+    test "boots the missing runners at once, so a caller does not take their place",
+         config do
+      FaultyBackend.arm(config.test, :fail, 1)
+
+      capture_log(fn ->
+        opts = pool_opts(config, restore_min: true, min: 1, idle_shutdown_after: 100)
+        start_supervised!({Pool, opts})
+        assert FLAME.call(config.test, fn -> :works end) == :works
+      end)
+
+      Process.sleep(600)
+      assert length(runners(config.runner_sup)) == 1
     end
 
     test "logs nothing when the floor boots", config do
@@ -150,6 +195,17 @@ defmodule FLAME.PoolFloorTest do
 
       assert length(runners(config.runner_sup)) == 2
       refute log =~ "failed to boot"
+    end
+  end
+
+  describe "strict_min_boot" do
+    test "fails the start of a restore_min pool when a floor runner fails", config do
+      FaultyBackend.arm(config.test, :fail, 1)
+
+      capture_log(fn ->
+        opts = pool_opts(config, restore_min: true, strict_min_boot: true, min: 2)
+        assert {:error, _reason} = start_supervised({Pool, opts})
+      end)
     end
   end
 
