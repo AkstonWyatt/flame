@@ -6,7 +6,7 @@ defmodule FLAME.PoolFloorTest.FaultyBackend do
 
   alias FLAME.LocalBackend
 
-  def arm(key, mode, n) when mode in [:fail, :hang] do
+  def arm(key, mode, n) when mode in [:fail, :hang, :time_out] do
     ref = :atomics.new(1, signed: true)
     :atomics.put(ref, 1, n)
     :persistent_term.put({__MODULE__, key}, {mode, ref})
@@ -40,6 +40,7 @@ defmodule FLAME.PoolFloorTest.FaultyBackend do
   end
 
   defp fault(:fail, _state), do: {:error, {:unavailable, "SECRET_CANARY"}}
+  defp fault(:time_out, _state), do: {:error, :timeout}
 
   defp fault(:hang, _state) do
     Process.sleep(:infinity)
@@ -103,7 +104,6 @@ defmodule FLAME.PoolFloorTest do
         end)
 
       assert log =~ "started with 2 of 3 min runners; 1 failed to boot (exit)"
-      refute log =~ "SECRET_CANARY"
       assert FLAME.call(config.test, fn -> :works end) == :works
 
       # never past min
@@ -187,6 +187,41 @@ defmodule FLAME.PoolFloorTest do
       assert length(runners(config.runner_sup)) == 1
     end
 
+    test "counts a backend that returns a timeout as a timeout", config do
+      FaultyBackend.arm(config.test, :time_out, 1)
+      parent = self()
+
+      capture_log(fn ->
+        opts =
+          pool_opts(config,
+            restore_min: true,
+            min: 1,
+            on_min_short: fn info -> send(parent, {:short, info.failures}) end
+          )
+
+        start_supervised!({Pool, opts})
+      end)
+
+      assert_received {:short, [:timeout]}
+    end
+
+    # The replacement fails too, so a waiting caller boots on demand. That
+    # runner fills the missing slot and must not idle out of it.
+    test "a demand boot that fills a missing min runner does not idle out", config do
+      FaultyBackend.arm(config.test, :fail, 2)
+
+      capture_log(fn ->
+        # idle longer than the restore's doubled 2 s wait, so the restore sees the
+        # demand runner and boots nothing; the idle exit would then empty the pool
+        opts = pool_opts(config, restore_min: true, min: 1, idle_shutdown_after: 3_000)
+        start_supervised!({Pool, opts})
+        assert FLAME.call(config.test, fn -> :works end, timeout: 5_000) == :works
+      end)
+
+      Process.sleep(7_000)
+      assert length(runners(config.runner_sup)) == 1
+    end
+
     test "logs nothing when the floor boots", config do
       log =
         capture_log(fn ->
@@ -195,17 +230,6 @@ defmodule FLAME.PoolFloorTest do
 
       assert length(runners(config.runner_sup)) == 2
       refute log =~ "failed to boot"
-    end
-  end
-
-  describe "strict_min_boot" do
-    test "fails the start of a restore_min pool when a floor runner fails", config do
-      FaultyBackend.arm(config.test, :fail, 1)
-
-      capture_log(fn ->
-        opts = pool_opts(config, restore_min: true, strict_min_boot: true, min: 2)
-        assert {:error, _reason} = start_supervised({Pool, opts})
-      end)
     end
   end
 

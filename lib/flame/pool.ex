@@ -69,7 +69,6 @@ defmodule FLAME.Pool do
             on_shrink: nil,
             async_boot_timer: nil,
             restore_min?: false,
-            strict_min_boot?: false,
             on_min_short: nil,
             restore_timer: nil,
             restore_delay: @async_boot_debounce,
@@ -149,15 +148,13 @@ defmodule FLAME.Pool do
 
     * `:restore_min` - When `true`, a running runner that goes down unexpectedly and leaves
       the pool below `:min` is replaced, with a growing pause between failed attempts.
+      A demand boot while the pool is below `:min` boots a `:min` runner, which does not
+      idle out.
       Only applies when `:min_idle_shutdown_after` is `:infinity` and runners are not
       `:single_use`, since those pools let their `:min` runners exit on purpose.
       Such a pool also starts when some of its `:min` runners fail to boot or outlast
       `:boot_timeout`: those runners are stopped, an error is logged, and the restore
       boots the missing runners in the background. Defaults to `false`.
-
-    * `:strict_min_boot` - When `true`, a `:restore_min` pool fails its start when a
-      `:min` runner fails to boot, as a pool without `:restore_min` does. For a caller
-      that would rather fall back to other options than run short. Defaults to `false`.
 
     * `:on_min_short` - The optional 1-arity function called when a `:restore_min` pool
       starts with fewer than `:min` runners. It runs inside the pool's `init/1`, and
@@ -261,7 +258,6 @@ defmodule FLAME.Pool do
       :idle_shutdown_after,
       :min_idle_shutdown_after,
       :restore_min,
-      :strict_min_boot,
       :on_min_short,
       :min,
       :max,
@@ -496,7 +492,6 @@ defmodule FLAME.Pool do
           Keyword.get(opts, :min_idle_shutdown_after, :infinity) == :infinity and
           not Keyword.get(opts, :single_use, false),
       max_concurrency: Keyword.get(opts, :max_concurrency, @default_max_concurrency),
-      strict_min_boot?: Keyword.get(opts, :strict_min_boot, false),
       on_min_short: opts[:on_min_short],
       on_grow_start: opts[:on_grow_start],
       on_grow_end: opts[:on_grow_end],
@@ -768,8 +763,7 @@ defmodule FLAME.Pool do
   # the runners that came up, and the restore boots the rest in the background.
   # Without `:restore_min` nothing would refill the floor, so those pools keep the
   # strict start below.
-  defp boot_runners(%Pool{restore_min?: true, strict_min_boot?: false, min: min} = state)
-       when min > 0 do
+  defp boot_runners(%Pool{restore_min?: true, min: min} = state) when min > 0 do
     boot_floor_tolerant(state)
   end
 
@@ -858,9 +852,10 @@ defmodule FLAME.Pool do
 
       notify_min_short(state, failures)
 
-      # Booted now rather than after the restore's debounce: a demand boot in that
-      # window would take the missing slot as an idling runner, and when it idled
-      # out nothing would put the floor runner back.
+      # Booted now rather than after the restore's debounce, so a caller that
+      # arrives at once waits on a floor runner instead of booting an idling one.
+      # Should a caller still find the pool short (the replacement failed too),
+      # its demand boot takes the floor runner's idle policy (`async_boot_runner/1`).
       restore_min(state)
     end
   end
@@ -891,6 +886,8 @@ defmodule FLAME.Pool do
   # The pool's own deadline, or the backend's or Runner's deadline reached first.
   defp failure_kind({:exit, :timeout}), do: :timeout
   defp failure_kind({:ok, {:error, {:exit, {:timeout, _call}}}}), do: :timeout
+  # A backend that returns `{:error, :timeout}` stops its Runner with this reason.
+  defp failure_kind({:ok, {:error, {:exit, {{:shutdown, :timeout}, _call}}}}), do: :timeout
   defp failure_kind(_result), do: :exit
 
   defp schedule_async_boot_runner(%Pool{} = state) do
@@ -899,8 +896,16 @@ defmodule FLAME.Pool do
     %{state | async_boot_timer: timer}
   end
 
+  # A demand boot while a `:restore_min` pool is below `:min` fills a missing
+  # `:min` runner, so it is booted as one: it does not idle out, and the restore,
+  # which counts it, never has to put the slot back.
   defp async_boot_runner(%Pool{} = state) do
-    {_ref, state} = start_async_boot(state, [], :demand)
+    runner_opts =
+      if state.restore_min? and runner_count(state) < restore_floor(state),
+        do: floor_runner_opts(state),
+        else: []
+
+    {_ref, state} = start_async_boot(state, runner_opts, :demand)
     state
   end
 
@@ -1009,7 +1014,7 @@ defmodule FLAME.Pool do
         {:error, reason} -> {:error, reason}
       end
     catch
-      {:exit, reason} -> {:error, {:exit, reason}}
+      :exit, reason -> {:error, {:exit, reason}}
     end
   end
 
