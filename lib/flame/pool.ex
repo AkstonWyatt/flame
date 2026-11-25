@@ -88,7 +88,9 @@ defmodule FLAME.Pool do
   `:min_idle_shutdown_after` of `:infinity` it stays up until it is stopped, so a
   caller that grows the pool to replace a runner is expected to stop that runner.
 
-  `timeout` bounds only the caller's wait. Timing out does not cancel the boot.
+  `timeout` bounds only the caller's wait. Timing out does not cancel the boot,
+  except that in a `:restore_min` pool every boot is stopped at `:boot_timeout`,
+  and the caller then gets `{:error, reason}`.
 
   The growth callbacks receive `reason: :grow` in their metadata.
   """
@@ -921,7 +923,13 @@ defmodule FLAME.Pool do
          reason
        ) do
     new_count = runner_count(state) + 1
-    deadline = boot_deadline(state)
+
+    # In a `:restore_min` pool every boot gets the floor boot's deadline. The
+    # restore counts pending boots of any kind, so one that never answers would
+    # hold a slot the restore thinks is filled, and the floor would stay short
+    # with no restore scheduled. Failed, it frees the slot and the restore boots
+    # it again. Other pools keep upstream's unbounded wait.
+    deadline = if state.restore_min?, do: state.boot_timeout
 
     task =
       Task.Supervisor.async_nolink(state.task_sup, fn ->
@@ -934,14 +942,6 @@ defmodule FLAME.Pool do
     new_pending = Map.put(state.pending_runners, task.ref, task.pid)
     {task.ref, %{state | pending_runners: new_pending}}
   end
-
-  # In a `:restore_min` pool every boot gets the floor boot's deadline. The restore
-  # counts pending boots of any kind, so one that never answers would hold a slot
-  # the restore thinks is filled, and the floor would stay short with no restore
-  # scheduled. Failed, it frees the slot and the restore boots it again. Other
-  # pools keep upstream's unbounded wait.
-  defp boot_deadline(%Pool{restore_min?: true} = state), do: state.boot_timeout
-  defp boot_deadline(%Pool{}), do: nil
 
   # A runner that stands in for a `:min` runner is booted the way `boot_runners/1`
   # boots them, so it is not shut down as idle before work is placed on it.

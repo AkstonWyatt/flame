@@ -304,12 +304,22 @@ defmodule FLAME.PoolFloorTest do
         # fill the floor runner's two slots
         for _ <- 1..2 do
           spawn(fn ->
-            FLAME.call(config.test, fn -> Process.sleep(:infinity) end, timeout: 60_000)
+            FLAME.call(
+              config.test,
+              fn ->
+                send(parent, :slot_taken)
+                Process.sleep(:infinity)
+              end,
+              timeout: 60_000
+            )
           end)
         end
 
-        Process.sleep(200)
+        assert_receive :slot_taken, 2_000
+        assert_receive :slot_taken, 2_000
         FaultyBackend.arm(config.test, :hang, 1)
+        # The caller must give up before its hung boot fails (300 ms) plus the 1 s
+        # demand debounce, or the demand retry fills the floor before the restore.
         spawn(fn -> catch_exit(FLAME.call(config.test, fn -> :ok end, timeout: 1_000)) end)
         assert_receive {:grow_start, :demand}, 2_000
 
